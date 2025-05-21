@@ -19,8 +19,6 @@ def setup_parser():
     parser = argparse.ArgumentParser(description='Reproduce of multiple pre-trained incremental learning algorthms.')
     parser.add_argument('--config', type=str, default='./exps/inr/moe_in21k.json',
                         help='Json file of settings.')
-    parser.add_argument('--exp', type=str, default='sequential',
-                        help='exp.')
     return parser
 
 if __name__ == '__main__':

@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from utils.inc_net import MoeNet
+from utils.inc_net import MoteNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 import copy
@@ -16,7 +16,7 @@ num_workers = 8
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
-        self._network = MoeNet(args, True)
+        self._network = MoteNet(args, True)
         
         self.args = args
         self.batch_size = args["batch_size"]
@@ -25,23 +25,7 @@ class Learner(BaseLearner):
         self.min_lr = args["min_lr"] if args["min_lr"] is not None else 1e-8
         self.init_cls = args["init_cls"]
         self.inc = args["increment"]
-
-        self.use_exemplars = args["use_old_data"]
-        self.use_init_ptm = args["use_init_ptm"]
-        self.use_diagonal = args["use_diagonal"]
-        
-        self.recalc_sim = args["recalc_sim"]
-        self.alpha = args["alpha"] # forward_reweight is divide by _cur_task
-        self.beta = args["beta"]
-
-        self.moni_adam = args["moni_adam"]
         self.adapter_num = args["adapter_num"]
-        self.cur_adapter = 1
-
-        if self.moni_adam:
-            self.use_init_ptm = True
-            self.alpha = 1 
-            self.beta = 1
 
     def after_task(self):
         self._known_classes = self._total_classes
@@ -57,13 +41,11 @@ class Learner(BaseLearner):
         
         return start_cls, end_cls
         
-    # (proxy_fc = cls * dim)
     def replace_fc(self, train_loader):
         model = self._network
         model = model.eval()
         
-        with torch.no_grad():           
-            # replace proto for each adapter in the current task
+        with torch.no_grad():
             if self.use_init_ptm:
                 start_idx = -1
             else:
@@ -86,89 +68,16 @@ class Learner(BaseLearner):
                     embedding = embedding_list[data_index]
                     proto = embedding.mean(0)
                     if self.use_init_ptm:
-                        model.fc.weight.data[class_index, :] = proto
+                        model.proto_list = proto
                     else:
                         model.fc.weight.data[class_index, :] = proto
                 model.backbone.update_proto_list(self._total_classes, model.fc.weight.data)
-    
-    def replace_fc_with_limited_adapters(self, train_loader):
-        model = self._network
-        model = model.eval()
-        
-        # 获取 Adapter 数量限制
-        adapter_num = min(self._cur_task + 1, self.adapter_num)
 
-        with torch.no_grad():
-            # 提取前 adapter_num 个 Adapter 的类原型
-            proto_by_adapter = {}
-            for index in range(adapter_num):
-                embedding_list, label_list = [], []
-
-                for _, data, label in train_loader:
-                    data = data.to(self._device)
-                    label = label.to(self._device)
-                    embedding = model.backbone.forward_proto(data, adapt_index=index)
-                    embedding_list.append(embedding.cpu())
-                    label_list.append(label.cpu())
-
-                # 合并嵌入和标签
-                embedding_list = torch.cat(embedding_list, dim=0)
-                label_list = torch.cat(label_list, dim=0)
-
-                # 提取每个类别的类原型
-                class_list = label_list.unique().tolist()
-                proto_by_adapter[index] = {}
-                for class_index in class_list:
-                    data_index = (label_list == class_index).nonzero().squeeze(-1)
-                    embedding = embedding_list[data_index]
-                    proto = embedding.mean(0)  # 计算类原型
-                    proto_by_adapter[index][class_index] = proto
-
-            # 对于后续任务，通过加权混合计算类原型
-            for class_index in range(self._total_classes):
-                # 收集所有 Adapter 对该类别的类原型组成候选
-                proto_candidates = []
-                for index in range(adapter_num):
-                    if class_index in proto_by_adapter[index]:
-                        proto_candidates.append((proto_by_adapter[index][class_index], index))
-                
-                # 如果当前类别没有候选类原型，跳过（可能是新类别）
-                if not proto_candidates:
-                    continue
-
-                # 计算每个候选类原型的权重
-                weights = []
-                for proto, index in proto_candidates:
-                    if index == 0:  # 对应的历史类范围
-                        ref_classes = list(range(0, self.adapter_num * self.inc))  # 假设每任务 10 类
-                    else:
-                        ref_classes = list(range(index * self.inc), (index + 1) * self.inc)
-
-                    # 计算相似度
-                    ref_protos = torch.stack([proto_by_adapter[index].get(c, torch.zeros_like(proto)) for c in ref_classes])
-                    sim_scores = torch.cosine_similarity(proto.unsqueeze(0), ref_protos, dim=-1)
-                    weight = sim_scores.mean().item()  # 平均相似度作为权重
-                    weights.append(weight)
-
-                # 归一化权重
-                weights = torch.tensor(weights)
-                weights = weights / weights.sum()
-
-                # 融合类原型
-                final_proto = sum(weight * proto_candidates[i][0] for i, weight in enumerate(weights))
-                model.fc.weight.data[class_index, :] = final_proto
-
-            # 更新模型中的类原型列表
-            model.backbone.update_proto_list(self._total_classes, model.fc.weight.data)
-
-
-         
     def incremental_train(self, data_manager):
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
-        # self._network.show_trainable_params()
         
         self.data_manager = data_manager
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train")
@@ -187,12 +96,8 @@ class Learner(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self.replace_fc(self.train_loader_for_protonet)
-        
-        if self.cur_adapter < self.adapter_num:
-            self._network.backbone.add_adapter_to_list(add_adapter = True)
-            self.cur_adapter += 1
-        else:
-            self._network.backbone.add_adapter_to_list(add_adapter = False)
+        self._network.freeze()
+        self._network.backbone.add_adapter_to_list()
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -201,8 +106,6 @@ class Learner(BaseLearner):
             optimizer = self.get_optimizer(lr=self.args["init_lr"])
             scheduler = self.get_scheduler(optimizer, self.args["init_epochs"])
         else:
-            # for base 0 setting, the later_lr and later_epochs are not used
-            # for base N setting, the later_lr and later_epochs are used
             if "later_lr" not in self.args or self.args["later_lr"] == 0:
                 self.args["later_lr"] = self.args["init_lr"]
             if "later_epochs" not in self.args or self.args["later_epochs"] == 0:
@@ -330,19 +233,18 @@ class Learner(BaseLearner):
             inputs = inputs.to(self._device)
 
             with torch.no_grad():
-                outputs = self._network.forward(inputs, test=True)["logits"]
+                outputs,_ = self._network.forward(inputs, test=True)
+                outs = outputs["logits"]
             predicts = torch.topk(
-                outputs, k=self.topk, dim=1, largest=True, sorted=True
+                outs, k=self.topk, dim=1, largest=True, sorted=True
             )[
                 1
-            ]  # [bs, topk]
+            ]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
-            
-            # calculate the accuracy by using task_id
             if calc_task_acc:
                 task_ids = (targets - self.init_cls) // self.inc + 1
-                task_logits = torch.zeros(outputs.shape).to(self._device)
+                task_logits = torch.zeros(outs.shape).to(self._device)
                 for i, task_id in enumerate(task_ids):
                     if task_id == 0:
                         start_cls = 0
@@ -350,9 +252,8 @@ class Learner(BaseLearner):
                     else:
                         start_cls = self.init_cls + (task_id-1)*self.inc
                         end_cls = self.init_cls + task_id*self.inc
-                    task_logits[i, start_cls:end_cls] += outputs[i, start_cls:end_cls]
-                # calculate the accuracy of task_id
-                pred_task_ids = (torch.max(outputs, dim=1)[1] - self.init_cls) // self.inc + 1
+                    task_logits[i, start_cls:end_cls] += outs[i, start_cls:end_cls]
+                pred_task_ids = (torch.max(outs, dim=1)[1] - self.init_cls) // self.inc + 1
                 task_correct += (pred_task_ids.cpu() == task_ids).sum()
                 
                 pred_task_y = torch.max(task_logits, dim=1)[1]

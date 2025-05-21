@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-from utils.inc_net import MofeNet
+from utils.inc_net import MoteNet
 from models.base import BaseLearner
 from utils.toolkit import tensor2numpy
 import copy
@@ -16,29 +16,18 @@ num_workers = 8
 class Learner(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
-        self._network = MofeNet(args, True)
+        self._network = MoteNet(args, True)
         
         self.args = args
         self.batch_size = args["batch_size"]
         self.init_lr = args["init_lr"]
-        self.later_lr = args["later_lr"]
         self.weight_decay = args["weight_decay"] if args["weight_decay"] is not None else 0.0005
         self.min_lr = args["min_lr"] if args["min_lr"] is not None else 1e-8
         self.init_cls = args["init_cls"]
         self.inc = args["increment"]
-
-        self.use_exemplars = args["use_old_data"]
-        self.use_init_ptm = args["use_init_ptm"]
-        self.use_diagonal = args["use_diagonal"]
-        
-        self.recalc_sim = args["recalc_sim"]
-        self.alpha = args["alpha"] # forward_reweight is divide by _cur_task
-        self.beta = args["beta"]
-
-        self.moni_adam = args["moni_adam"]
         self.adapter_num = args["adapter_num"]
         self.cur_adapter = 1
-        
+
         if self.moni_adam:
             self.use_init_ptm = True
             self.alpha = 1 
@@ -71,27 +60,17 @@ class Learner(BaseLearner):
                 start_idx = 0
 
             for index in range(start_idx, self._cur_task + 1):
-                if self.moni_adam:
-                    if index > self.adapter_num - 1:
-                        break
-                # only use the diagonal feature, index = -1 denotes using init PTM, index = self._cur_task denotes the last adapter's feature
-                elif self.use_diagonal and index != -1 and index != self._cur_task:
-                    continue
-
                 embedding_list, label_list = [], []
                 for i, batch in enumerate(train_loader):
                     (_, data, label) = batch
                     data = data.to(self._device)
                     label = label.to(self._device)
-                    embedding = model.backbone.forward_proto(data)
+                    embedding = model.backbone.forward_proto(data, adapt_index=index)
                     embedding_list.append(embedding.cpu())
                     label_list.append(label.cpu())
-                # 所有adapter生成的 embedding 和标签
                 embedding_list = torch.cat(embedding_list, dim=0)
                 label_list = torch.cat(label_list, dim=0)
-                # 所有类的列表
                 class_list = np.unique(self.train_dataset_for_protonet.labels)
-                # 遍历所有类
                 for class_index in class_list:
                     data_index = (label_list == class_index).nonzero().squeeze(-1)
                     embedding = embedding_list[data_index]
@@ -101,17 +80,71 @@ class Learner(BaseLearner):
                     else:
                         model.fc.weight.data[class_index, :] = proto
                 model.backbone.update_proto_list(self._total_classes, model.fc.weight.data)
+    
+    def replace_fc_with_limited_adapters(self, train_loader):
+        model = self._network
+        model = model.eval()
+        
+        adapter_num = min(self._cur_task + 1, self.adapter_num)
 
-        if self.use_diagonal or self.use_exemplars:
-            return
+        with torch.no_grad():
+            proto_by_adapter = {}
+            for index in range(adapter_num):
+                embedding_list, label_list = [], []
+
+                for _, data, label in train_loader:
+                    data = data.to(self._device)
+                    label = label.to(self._device)
+                    embedding = model.backbone.forward_proto(data, adapt_index=index)
+                    embedding_list.append(embedding.cpu())
+                    label_list.append(label.cpu())
+
+                embedding_list = torch.cat(embedding_list, dim=0)
+                label_list = torch.cat(label_list, dim=0)
+
+                class_list = label_list.unique().tolist()
+                proto_by_adapter[index] = {}
+                for class_index in class_list:
+                    data_index = (label_list == class_index).nonzero().squeeze(-1)
+                    embedding = embedding_list[data_index]
+                    proto = embedding.mean(0)
+                    proto_by_adapter[index][class_index] = proto
+
+            for class_index in range(self._total_classes):
+                proto_candidates = []
+                for index in range(adapter_num):
+                    if class_index in proto_by_adapter[index]:
+                        proto_candidates.append((proto_by_adapter[index][class_index], index))
+                
+                if not proto_candidates:
+                    continue
+
+                weights = []
+                for proto, index in proto_candidates:
+                    if index == 0:
+                        ref_classes = list(range(0, self.adapter_num * self.inc))
+                    else:
+                        ref_classes = list(range(index * self.inc), (index + 1) * self.inc)
+
+                    ref_protos = torch.stack([proto_by_adapter[index].get(c, torch.zeros_like(proto)) for c in ref_classes])
+                    sim_scores = torch.cosine_similarity(proto.unsqueeze(0), ref_protos, dim=-1)
+                    weight = sim_scores.mean().item()
+                    weights.append(weight)
+
+                weights = torch.tensor(weights)
+                weights = weights / weights.sum()
+                final_proto = sum(weight * proto_candidates[i][0] for i, weight in enumerate(weights))
+                model.fc.weight.data[class_index, :] = final_proto
+
+            model.backbone.update_proto_list(self._total_classes, model.fc.weight.data)
+
+
          
     def incremental_train(self, data_manager):
         self._cur_task += 1
-
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
-        # self._network.show_trainable_params()
         
         self.data_manager = data_manager
         self.train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source="train", mode="train")
@@ -122,36 +155,39 @@ class Learner(BaseLearner):
         
         self.train_dataset_for_protonet = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes),source="train", mode="test")
         self.train_loader_for_protonet = DataLoader(self.train_dataset_for_protonet, batch_size=self.batch_size, shuffle=True, num_workers=num_workers)
+
         if len(self._multiple_gpus) > 1:
             print('Multiple GPUs')
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
         self._train(self.train_loader, self.test_loader)
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
-
+        self.replace_fc_with_limited_adapters(self.train_loader_for_protonet)
+        
         if self.cur_adapter < self.adapter_num:
             self._network.backbone.add_adapter_to_list(add_adapter = True)
             self.cur_adapter += 1
         else:
             self._network.backbone.add_adapter_to_list(add_adapter = False)
 
-        self.replace_fc(self.train_loader_for_protonet)
-
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
-        if self.cur_adapter < self.adapter_num or self._cur_task == 0:
+        
+        if self._cur_task == 0 or self.init_cls == self.inc:
             optimizer = self.get_optimizer(lr=self.args["init_lr"])
             scheduler = self.get_scheduler(optimizer, self.args["init_epochs"])
         else:
+            if "later_lr" not in self.args or self.args["later_lr"] == 0:
+                self.args["later_lr"] = self.args["init_lr"]
+            if "later_epochs" not in self.args or self.args["later_epochs"] == 0:
+                self.args["later_epochs"] = self.args["init_epochs"]
+
             optimizer = self.get_optimizer(lr=self.args["later_lr"])
             scheduler = self.get_scheduler(optimizer, self.args["later_epochs"])
+
         self._init_train(train_loader, test_loader, optimizer, scheduler)
     
     def get_optimizer(self, lr):
-        logging.info("Training parameters:")
-        for name, param in self._network.named_parameters():
-            if param.requires_grad:
-                logging.info(f"Parameter Name: {name}, Shape: {param.shape}, Requires Grad: {param.requires_grad}")
         if self.args['optimizer'] == 'sgd':
             optimizer = optim.SGD(
                 filter(lambda p: p.requires_grad, self._network.parameters()), 
@@ -189,7 +225,7 @@ class Learner(BaseLearner):
             if self._cur_task > self.adapter_num - 1:
                 return
         
-        if self.cur_adapter < self.adapter_num or self._cur_task == 0:
+        if self._cur_task == 0 or self.init_cls == self.inc:
             epochs = self.args['init_epochs']
         else:
             epochs = self.args['later_epochs']
@@ -255,6 +291,8 @@ class Learner(BaseLearner):
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     def _eval_cnn(self, loader):
+        self._network.backbone.multicount = 0
+        self._network.backbone.zerocount = 0
         calc_task_acc = True
         
         if calc_task_acc:
@@ -271,11 +309,10 @@ class Learner(BaseLearner):
                 outputs, k=self.topk, dim=1, largest=True, sorted=True
             )[
                 1
-            ]  # [bs, topk]
+            ]
             y_pred.append(predicts.cpu().numpy())
             y_true.append(targets.cpu().numpy())
             
-            # calculate the accuracy by using task_id
             if calc_task_acc:
                 task_ids = (targets - self.init_cls) // self.inc + 1
                 task_logits = torch.zeros(outputs.shape).to(self._device)
@@ -287,7 +324,6 @@ class Learner(BaseLearner):
                         start_cls = self.init_cls + (task_id-1)*self.inc
                         end_cls = self.init_cls + task_id*self.inc
                     task_logits[i, start_cls:end_cls] += outputs[i, start_cls:end_cls]
-                # calculate the accuracy of task_id
                 pred_task_ids = (torch.max(outputs, dim=1)[1] - self.init_cls) // self.inc + 1
                 task_correct += (pred_task_ids.cpu() == task_ids).sum()
                 
@@ -298,5 +334,6 @@ class Learner(BaseLearner):
         if calc_task_acc:
             logging.info("Task correct: {}".format(tensor2numpy(task_correct) * 100 / total))
             logging.info("Task acc: {}".format(tensor2numpy(task_acc) * 100 / total))
-                
+        logging.info("multi-expert-num: {}".format(self._network.backbone.multicount))
+        logging.info("zero-expert-num: {}".format(self._network.backbone.zerocount))
         return np.concatenate(y_pred), np.concatenate(y_true)  # [N, topk]

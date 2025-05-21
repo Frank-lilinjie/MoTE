@@ -9,10 +9,10 @@ in1k = './checkpoints/B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0-
 in21k = './checkpoints/B_16-i21k-300ep-lr_0.001-aug_medium1-wd_0.1-do_0.0-sd_0.0.npz'
 def get_backbone(args, pretrained=False):
     name = args["backbone_type"].lower()
-    if '_moe' in name:
+    if '_mote' in name:
         ffn_num = args["ffn_num"]
-        if args["model_name"] == "moe":
-            from backbone import vit_moe
+        if args["model_name"] == "mote":
+            from backbone import vit_mote
             from easydict import EasyDict
             tuning_config = EasyDict(
                 # AdaptFormer
@@ -30,43 +30,12 @@ def get_backbone(args, pretrained=False):
                 vpt_num=0,
                 _device = args["device"][0]
             )
-            if name == "vit_base_patch16_224_moe":
-                model = vit_moe.vit_base_patch16_224_moe(num_classes=0,
+            if name == "vit_base_patch16_224_mote":
+                model = vit_mote.vit_base_patch16_224_mote(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
                 model.out_dim=768
-            elif name == "vit_base_patch16_224_in21k_moe":
-                model = vit_moe.vit_base_patch16_224_in21k_moe(num_classes=0,
-                    global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-                model.out_dim=768
-            else:
-                raise NotImplementedError("Unknown type {}".format(name))
-            return model
-    elif '_mofe' in name:
-        ffn_num = args["ffn_num"]
-        if args["model_name"] == "mofe":
-            from backbone import vit_mofe
-            from easydict import EasyDict
-            tuning_config = EasyDict(
-                # AdaptFormer
-                ffn_adapt=True,
-                ffn_option="parallel",
-                ffn_adapter_layernorm_option="none",
-                ffn_adapter_init_option="lora",
-                ffn_adapter_scalar="0.1",
-                ffn_num=ffn_num,
-                d_model=768,
-                adapter_num=args["adapter_num"],
-                # VPT related
-                vpt_on=False,
-                vpt_num=0,
-                _device = args["device"][0]
-            )
-            if name == "vit_base_patch16_224_mofe":
-                model = vit_mofe.vit_base_patch16_224_mofe(num_classes=0,
-                    global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
-                model.out_dim=768
-            elif name == "vit_base_patch16_224_in21k_mofe":
-                model = vit_mofe.vit_base_patch16_224_in21k_mofe(num_classes=0,
+            elif name == "vit_base_patch16_224_in21k_mote":
+                model = vit_mote.vit_base_patch16_224_in21k_mote(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
                 model.out_dim=768
             else:
@@ -74,8 +43,8 @@ def get_backbone(args, pretrained=False):
             return model
     elif '_limit' in name:
         ffn_num = args["ffn_num"]
-        if args["model_name"] == "moe_limit":
-            from backbone import vit_moe_limit
+        if args["model_name"] == "mote_limit":
+            from backbone import vit_mote_limit
             from easydict import EasyDict
             tuning_config = EasyDict(
                 # AdaptFormer
@@ -94,11 +63,11 @@ def get_backbone(args, pretrained=False):
                 _device = args["device"][0]
             )
             if name == "vit_base_patch16_224_limit":
-                model = vit_moe_limit.vit_base_patch16_224_moe_limit(num_classes=0,
+                model = vit_moe_limit.vit_base_patch16_224_mote_limit(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
                 model.out_dim=768
             elif name == "vit_base_patch16_224_in21k_limit":
-                model = vit_moe_limit.vit_base_patch16_224_in21k_moe_limit(num_classes=0,
+                model = vit_moe_limit.vit_base_patch16_224_in21k_mote_limit(num_classes=0,
                     global_pool=False, drop_path_rate=0.0, tuning_config=tuning_config)
                 model.out_dim=768
             else:
@@ -168,64 +137,9 @@ class BaseNet(nn.Module):
 
         return self
 
-class MoeNet(BaseNet):
+class MoteNet(BaseNet):
     def __init__(self, args, pretrained):
-        super(MoeNet, self).__init__(args, pretrained)
-        self.args = args
-        self.inc = args["increment"]
-        self.init_cls = args["init_cls"]
-        self._cur_task = -1
-        self.out_dim =  self.backbone.out_dim
-        self.fc = None
-        self.use_init_ptm = args["use_init_ptm"]
-        self.alpha = args["alpha"]
-        self.beta = args["beta"]
-
-    @property
-    def feature_dim(self):
-        return self.backbone.out_dim
-    
-    def update_fc(self, nb_classes):
-        self._cur_task += 1
-        
-        if self._cur_task == 0:
-            self.proxy_fc = self.generate_fc(self.out_dim, self.init_cls).to(self._device)
-        else:
-            self.proxy_fc = self.generate_fc(self.out_dim, self.inc).to(self._device)
-        
-        fc = self.generate_fc(self.feature_dim, nb_classes).to(self._device)
-        
-        if self.fc is not None:
-            old_nb_classes = self.fc.out_features
-            weight = copy.deepcopy(self.fc.weight.data)
-            fc.sigma.data = self.fc.sigma.data
-            fc.weight.data[ : old_nb_classes, :] = nn.Parameter(weight)
-        del self.fc
-        self.fc = fc
-    
-    def generate_fc(self, in_dim, out_dim):
-        fc = CosineLinear(in_dim, out_dim)
-        return fc
-    
-    def forward(self, x, test=False):
-        if test == False:
-            x = self.backbone.forward(x, False)
-            out = self.proxy_fc(x)
-        else:
-            x = self.backbone.forward(x, True, use_init_ptm=self.use_init_ptm)
-            out = self.fc(x)
-            
-        out.update({"features": x})
-        return out
-    
-    def show_trainable_params(self):
-        for name, param in self.named_parameters():
-            if param.requires_grad:
-                print(name, param.numel())
-
-class MofeNet(BaseNet):
-    def __init__(self, args, pretrained):
-        super(MofeNet, self).__init__(args, pretrained)
+        super(MoteNet, self).__init__(args, pretrained)
         self.args = args
         self.inc = args["increment"]
         self.init_cls = args["init_cls"]

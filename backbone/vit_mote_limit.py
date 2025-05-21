@@ -257,6 +257,7 @@ class VisionTransformer(nn.Module):
         self.init = tuning_config.init
         self.inc = tuning_config.inc
         self.cur_adapter = nn.ModuleList()
+        self.add_adapter = True
         self.get_new_adapter()
         self.multicount = 0
         self.zerocount = 0
@@ -311,9 +312,15 @@ class VisionTransformer(nn.Module):
         else:
             print("====Not use adapter===")
 
-    def add_adapter_to_list(self):
-        self.adapter_list.append(copy.deepcopy(self.cur_adapter.requires_grad_(False)))
-        self.get_new_adapter()
+    def add_adapter_to_list(self, add_adapter = True):
+        if add_adapter:
+            self.adapter_list.append(copy.deepcopy(self.cur_adapter.requires_grad_(False)))
+            self.get_new_adapter()
+        elif add_adapter!=self.add_adapter:
+            self.adapter_list.append(copy.deepcopy(self.cur_adapter.requires_grad_(False)))
+            self.add_adapter = False
+        else:
+            self.add_adapter = False
     
     def forward_train(self, x):
         B = x.shape[0]
@@ -373,7 +380,7 @@ class VisionTransformer(nn.Module):
             logits.append(logit)
 
         # 这里嵌入投票法和专家合并
-        features = self.merge_and_reweight(B, features, logits)
+        features = self.vote_re(B, features, logits)
         return features
 
 
@@ -606,377 +613,6 @@ class VisionTransformer(nn.Module):
         
         return final_features
 
-    def vote_comb(self, batch_size, features, logits):
-        """
-        将基于置信度和投票法的两种策略结合，选择最优专家的特征。
-
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-
-        Returns:
-            Tensor: 融合后的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 动态生成专家任务范围
-        expert_ranges = []
-        start = 0
-        for i in range(len(logits)):  # 遍历当前所有专家
-            # 第一个任务类别范围为 [0, self.init)，后续任务每次增加 self.inc 个类别
-            end = start + (self.init if i == 0 else self.inc)
-            expert_ranges.append(range(start, end))
-            start = end
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-            
-            # 计算每个专家的预测结果及置信度
-            predictions = []
-            confidences = []
-            for exp in range(len(logits)):
-                # 预测类别 (argmax) 和对应的置信度 (softmax 最大值)
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                pred = torch.argmax(prob).item()
-                confidence = prob[pred].item()
-                predictions.append(pred)
-                confidences.append(confidence)
-            
-            # 找到所有在任务范围内的专家
-            valid_experts = [
-                exp for exp in range(len(logits)) if predictions[exp] in expert_ranges[exp]
-            ]
-
-            if len(valid_experts) == 1:
-                # 如果只有一个专家在任务范围内，直接选取该专家的特征
-                final_features.append(sample_features[valid_experts[0]])
-            
-            elif len(valid_experts) > 1:
-                # 多个专家在任务范围内，使用投票结合置信度加权
-                self.multicount += 1
-                prototype_predictions = [predictions[exp] for exp in valid_experts]
-                
-                # 计算投票得分
-                votes = [0] * len(valid_experts)
-                for exp_idx, exp in enumerate(valid_experts):
-                    for other_exp in range(len(logits)):
-                        if other_exp != exp:
-                            prob = torch.nn.functional.softmax(sample_logits[other_exp], dim=-1)
-                            votes[exp_idx] += prob[prototype_predictions[exp_idx]]
-
-                # 根据投票得分和置信度进行加权
-                weighted_votes = torch.tensor([
-                    votes[idx] + confidences[valid_experts[idx]] for idx in range(len(valid_experts))
-                ])
-                weights = torch.nn.functional.softmax(weighted_votes, dim=0)  # 使用 softmax 归一化
-
-                # 加权融合特征
-                mixed_feature = torch.stack(
-                    [sample_features[exp] * weights[idx] for idx, exp in enumerate(valid_experts)]
-                ).sum(dim=0)
-                final_features.append(mixed_feature)
-
-            else:
-                # 如果没有专家在任务范围内，选择置信度最高的专家
-                self.zerocount += 1
-                selected_expert = torch.argmax(torch.tensor(confidences)).item()
-                final_features.append(sample_features[selected_expert])
-    
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-        
-        return final_features
-
-
-    def vote_re_merge_only(self, batch_size, features, logits):
-        """
-        只进行专家合并的函数，通过置信度加权合并所有专家的特征。
-        
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-        
-        Returns:
-            Tensor: 合并后的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-
-            # 计算每个专家的置信度（softmax 最大值）
-            confidences = []
-            for exp in range(len(logits)):
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                confidence = torch.max(prob).item()  # 取 softmax 的最大值作为置信度
-                confidences.append(confidence)
-
-            # 对置信度进行 Softmax 归一化，得到权重
-            weights = torch.nn.functional.softmax(torch.tensor(confidences), dim=0)
-
-            # 根据权重加权合并特征
-            mixed_feature = torch.stack(
-                [sample_features[exp] * weights[exp] for exp in range(len(logits))]
-            ).sum(dim=0)
-
-            # 将合并后的特征加入最终特征列表
-            final_features.append(mixed_feature)
-
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-
-        return final_features
-    
-    def vote_re_reweight_only(self, batch_size, features, logits):
-        """
-        只进行重加权的函数，直接选取置信度最高的专家进行输出。
-        
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-        
-        Returns:
-            Tensor: 选取的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-
-            # 计算每个专家的置信度（softmax 最大值）
-            confidences = []
-            for exp in range(len(logits)):
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                confidence = torch.max(prob).item()  # 取 softmax 的最大值作为置信度
-                confidences.append(confidence)
-
-            # 选取置信度最高的专家
-            selected_expert = torch.argmax(torch.tensor(confidences)).item()
-            final_features.append(sample_features[selected_expert])
-
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-
-        return final_features
-
-    def filter_and_merge(self, batch_size, features, logits):
-        """
-        进行专家过滤后，选择任务范围内的专家并根据置信度进行加权，最后合并其特征。
-        
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-        
-        Returns:
-            Tensor: 重组后的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 动态生成专家任务范围
-        expert_ranges = []
-        start = 0
-        for i in range(len(logits)):  # 遍历当前所有专家
-            # 第一个任务类别范围为 [0, self.init)，后续任务每次增加 self.inc 个类别
-            end = start + (self.init if i == 0 else self.inc)
-            expert_ranges.append(range(start, end))
-            start = end
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-            
-            # 计算每个专家的预测结果及置信度
-            predictions = []
-            confidences = []
-            for exp in range(len(logits)):
-                # 预测类别 (argmax) 和对应的置信度 (softmax 最大值)
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                pred = torch.argmax(prob).item()
-                confidence = prob[pred].item()
-                predictions.append(pred)  # 预测结果
-                confidences.append(confidence)  # 置信度
-            
-            # 找到任务范围内的专家
-            valid_experts = [
-                exp for exp in range(len(logits)) if predictions[exp] in expert_ranges[exp]
-            ]
-            
-            if valid_experts:
-                # 对任务范围内的专家按置信度加权
-                weights = [confidences[exp] for exp in valid_experts]
-                # 对权重进行 Softmax 归一化
-                weights = torch.nn.functional.softmax(torch.tensor(weights), dim=0)
-                
-                # 根据权重混合特征
-                mixed_feature = torch.stack(
-                    [sample_features[exp] * weights[idx] for idx, exp in enumerate(valid_experts)]
-                ).sum(dim=0)
-                final_features.append(mixed_feature)
-            else:
-                # 没有专家在任务范围内，选择置信度最高的专家
-                self.zerocount += 1
-                selected_expert = torch.argmax(torch.tensor(confidences)).item()
-                final_features.append(sample_features[selected_expert])
-        
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-        
-        return final_features
-
-    def merge_and_reweight(self, batch_size, features, logits):
-        """
-        进行专家合并后，根据每个专家的置信度进行重加权，赋予置信度最高的专家更高的权重，
-        其余专家的权重乘以 0.1。
-        
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-        
-        Returns:
-            Tensor: 重组后的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-            
-            # 计算每个专家的预测结果及置信度
-            confidences = []
-            for exp in range(len(logits)):
-                # 预测类别 (argmax) 和对应的置信度 (softmax 最大值)
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                pred = torch.argmax(prob).item()
-                confidence = prob[pred].item()
-                confidences.append(confidence)  # 置信度
-            
-            # 获取最大置信度专家的索引
-            max_conf_idx = torch.argmax(torch.tensor(confidences)).item()  # 获取最大置信度专家的索引
-            
-            # 对所有专家的置信度进行加权
-            weights = []
-            for exp in range(len(logits)):
-                if exp == max_conf_idx:
-                    weights.append(confidences[exp])  # 保持最大置信度专家的权重不变
-                else:
-                    weights.append(confidences[exp] * 0.1)  # 其他专家的置信度 * 0.1
-            
-            weights = torch.tensor(weights)  # 转换为张量
-            
-            # 对权重进行 Softmax 归一化
-            weights = torch.nn.functional.softmax(weights, dim=0)
-            
-            # 根据加权后的权重合并特征
-            mixed_feature = torch.stack(
-                [sample_features[exp] * weights[exp] for exp in range(len(logits))]
-            ).sum(dim=0)
-            
-            final_features.append(mixed_feature)
-        
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-        
-        return final_features
-    # 这个不需要
-    def filter_and_reweight(self, batch_size, features, logits):
-        """
-        进行专家过滤后，根据每个专家的置信度进行重加权，并选取置信度最高的专家输出其特征。
-        
-        Args:
-            batch_size (int): Batch 中样本的数量。
-            features (list of tensors): 每个专家输出的特征列表，每个张量形状为 (batch_size, feature_dim)。
-            logits (list of tensors): 每个专家输出的 logits 列表，每个张量形状为 (batch_size, num_classes)。
-        
-        Returns:
-            Tensor: 重组后的特征，形状为 (batch_size, feature_dim)。
-        """
-        # 初始化保存最终选定特征的列表
-        final_features = []
-
-        # 动态生成专家任务范围
-        expert_ranges = []
-        start = 0
-        for i in range(len(logits)):  # 遍历当前所有专家
-            # 第一个任务类别范围为 [0, self.init)，后续任务每次增加 self.inc 个类别
-            end = start + (self.init if i == 0 else self.inc)
-            expert_ranges.append(range(start, end))
-            start = end
-
-        # 遍历 Batch 中的每个样本
-        for i in range(batch_size):
-            # 获取当前样本的 logits 和特征
-            sample_logits = [logits[exp][i] for exp in range(len(logits))]  # 每个专家的 logits
-            sample_features = [features[exp][i] for exp in range(len(logits))]  # 每个专家的特征
-            
-            # 计算每个专家的预测结果及置信度
-            predictions = []
-            confidences = []
-            for exp in range(len(logits)):
-                # 预测类别 (argmax) 和对应的置信度 (softmax 最大值)
-                prob = torch.nn.functional.softmax(sample_logits[exp], dim=-1)
-                pred = torch.argmax(prob).item()
-                confidence = prob[pred].item()
-                predictions.append(pred)  # 预测结果
-                confidences.append(confidence)  # 置信度
-            
-            # 找到所有任务范围内的专家
-            valid_experts = [
-                exp for exp in range(len(logits)) if predictions[exp] in expert_ranges[exp]
-            ]
-            
-            if len(valid_experts) > 0:
-                # 如果有专家在任务范围内，进行重加权
-                # 获取最大置信度专家的索引
-                max_conf_idx = torch.argmax(torch.tensor([confidences[exp] for exp in valid_experts])).item()
-                
-                # 对所有有效专家的置信度进行加权
-                weights = []
-                for exp in valid_experts:
-                    if exp == valid_experts[max_conf_idx]:
-                        weights.append(confidences[exp])  # 保持最大置信度专家的权重不变
-                    else:
-                        weights.append(confidences[exp] * 0.1)  # 其他专家的置信度 * 0.1
-                
-                weights = torch.tensor(weights)  # 转换为张量
-                # 归一化权重
-                weights = torch.nn.functional.softmax(weights, dim=0)
-                
-                # 选取置信度最高的专家的特征
-                selected_expert = valid_experts[max_conf_idx]
-                final_features.append(sample_features[selected_expert])
-            else:
-                # 如果没有专家在任务范围内，选择置信度最高的专家
-                self.zerocount += 1
-                selected_expert = torch.argmax(torch.tensor(confidences)).item()
-                final_features.append(sample_features[selected_expert])
-
-        # 将最终特征组合成一个张量
-        final_features = torch.stack(final_features, dim=0)
-        
-        return final_features
 
 
     def forward(self, x, test=False, use_init_ptm=False):
@@ -1025,7 +661,7 @@ class VisionTransformer(nn.Module):
         return output
         
 
-def vit_base_patch16_224_moe(pretrained=False, **kwargs):
+def vit_base_patch16_224_mote_limit(pretrained=False, **kwargs):
     
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
@@ -1069,7 +705,7 @@ def vit_base_patch16_224_moe(pretrained=False, **kwargs):
             p.requires_grad = False 
     return model
 
-def vit_base_patch16_224_in21k_moe(pretrained=False, **kwargs):
+def vit_base_patch16_224_in21k_mote_limit(pretrained=False, **kwargs):
     
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
